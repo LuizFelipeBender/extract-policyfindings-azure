@@ -6,6 +6,7 @@ import csv
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Optional, List, Dict, Any
+from collections import defaultdict
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.subscription import SubscriptionClient
@@ -13,17 +14,14 @@ from azure.mgmt.resource import ResourceManagementClient
 from msrestazure.tools import parse_resource_id  # para extrair o resourceGroup do ID (quando não vem no objeto)
 
 # ================== Config ==================
-# Limitar a um subconjunto de assinaturas (opcional)
 SUBSCRIPTION_ID_ALLOWLIST: Optional[List[str]] = None  # ex.: ["11111111-1111-1111-1111-111111111111"]
-
-# Filtrar por tipo de recurso (opcional). Ex.: "Microsoft.Compute/virtualMachines"
 RESOURCE_TYPE_FILTER: Optional[str] = None
-
-# Concurrency (número de threads para varrer assinaturas em paralelo)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
-# Nome do arquivo de saída
-OUT_FILE = f"resources_all_subs_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+STAMP = datetime.now(timezone.utc).strftime('%Y%m%d')
+OUT_FILE_DETAIL = f"resources_all_subs_{STAMP}.csv"
+OUT_FILE_COUNTS = f"resource_counts_by_sub_type_{STAMP}.csv"
+OUT_FILE_NAMES  = f"resource_names_by_sub_type_{STAMP}.csv"
 
 # ================== Auth ==================
 credential = DefaultAzureCredential()
@@ -49,26 +47,22 @@ def safe_list_resources(sub_id: str) -> Iterable[Any]:
         try:
             if delay:
                 time.sleep(delay)
-            # resources.list() pagina automaticamente
             return client.resources.list(expand="createdTime,changedTime")
-        except Exception as e:  # HttpResponseError, ServiceRequestError etc.
+        except Exception as e:
             last_err = e
-    # se falhar, propaga a última exceção
     raise last_err
 
 def normalize_row(sub_id: str, sub_name: str, r: Any) -> Dict[str, Any]:
     """
     Constrói uma linha padronizada do recurso.
     """
-    # Alguns SDKs não trazem resource_group direto, então extraímos do ID
     try:
         rg = getattr(r, "resource_group", None)
-        if not rg:
+        if not rg and getattr(r, "id", None):
             rg = parse_resource_id(r.id).get("resource_group")
     except Exception:
         rg = None
 
-    # Campos comuns
     row = {
         "subscriptionId": sub_id,
         "subscriptionName": sub_name,
@@ -84,7 +78,6 @@ def normalize_row(sub_id: str, sub_name: str, r: Any) -> Dict[str, Any]:
         "changedTime": getattr(r, "changed_time", None),
     }
 
-    # Tags (dicionário) -> string chave=valor;chave2=valor2
     tags = getattr(r, "tags", None)
     if isinstance(tags, dict):
         row["tags"] = ";".join(f"{k}={v}" for k, v in tags.items())
@@ -120,11 +113,11 @@ def main():
             except Exception as e:
                 print(f"[ERRO] {sub['name']} ({sub['id']}): {e}")
 
-    # Ordena pelos campos de interesse: tipo, assinatura, nome do recurso
+    # Ordena detalhado: tipo, assinatura, nome
     all_rows.sort(key=lambda x: (x.get("resourceType") or "", x.get("subscriptionName") or "", x.get("resourceName") or ""))
 
-    # Escreve CSV
-    fieldnames = [
+    # ---------- CSV DETALHADO ----------
+    detail_fields = [
         "subscriptionId",
         "subscriptionName",
         "resourceId",
@@ -138,13 +131,50 @@ def main():
         "createdTime",
         "changedTime",
     ]
-    with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(OUT_FILE_DETAIL, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=detail_fields)
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"\nSalvo: {OUT_FILE}")
-    print(f"Total de recursos: {len(all_rows)}")
+    # ---------- AGREGAÇÕES POR ASSINATURA & TIPO ----------
+    # Contagem por (subscriptionId, subscriptionName, resourceType)
+    counts = defaultdict(lambda: defaultdict(int))
+    # Nomes por (subscriptionId, subscriptionName, resourceType)
+    names  = defaultdict(lambda: defaultdict(list))
+
+    for row in all_rows:
+        sub_id   = row["subscriptionId"] or ""
+        sub_name = row["subscriptionName"] or ""
+        rtype    = row["resourceType"] or ""
+        rname    = row["resourceName"] or ""
+
+        counts[(sub_id, sub_name)][rtype] += 1
+        if rname:
+            names[(sub_id, sub_name)][rtype].append(rname)
+
+    # ---------- CSV DE CONTAGEM ----------
+    with open(OUT_FILE_COUNTS, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["subscriptionId", "subscriptionName", "resourceType", "count"])
+        for (sub_id, sub_name), type_map in sorted(counts.items(), key=lambda x: (x[0][1], x[0][0])):  # ordena por nome/id
+            for rtype, qty in sorted(type_map.items()):
+                writer.writerow([sub_id, sub_name, rtype, qty])
+
+    # ---------- CSV DE NOMES POR TIPO ----------
+    with open(OUT_FILE_NAMES, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["subscriptionId", "subscriptionName", "resourceType", "resourceNames"])
+        for (sub_id, sub_name), type_map in sorted(names.items(), key=lambda x: (x[0][1], x[0][0])):
+            for rtype, name_list in sorted(type_map.items()):
+                # nomes únicos e ordenados para legibilidade
+                uniq_sorted = sorted(set(filter(None, name_list)))
+                writer.writerow([sub_id, sub_name, rtype, ";".join(uniq_sorted)])
+
+    print(f"\nSalvos:")
+    print(f" - Detalhado: {OUT_FILE_DETAIL} (todos os recursos, com resourceName e resourceType)")
+    print(f" - Contagem : {OUT_FILE_COUNTS} (count por subscription x resourceType)")
+    print(f" - Nomes    : {OUT_FILE_NAMES} (lista de nomes por subscription x resourceType)")
+    print(f"\nTotal de recursos: {len(all_rows)}")
 
 if __name__ == "__main__":
     main()
