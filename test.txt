@@ -1,0 +1,150 @@
+# list_all_resources_by_sub_and_type.py
+from __future__ import annotations
+from datetime import datetime, timezone
+import os
+import csv
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterable, Optional, List, Dict, Any
+
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.subscription import SubscriptionClient
+from azure.mgmt.resource import ResourceManagementClient
+from msrestazure.tools import parse_resource_id  # para extrair o resourceGroup do ID (quando não vem no objeto)
+
+# ================== Config ==================
+# Limitar a um subconjunto de assinaturas (opcional)
+SUBSCRIPTION_ID_ALLOWLIST: Optional[List[str]] = None  # ex.: ["11111111-1111-1111-1111-111111111111"]
+
+# Filtrar por tipo de recurso (opcional). Ex.: "Microsoft.Compute/virtualMachines"
+RESOURCE_TYPE_FILTER: Optional[str] = None
+
+# Concurrency (número de threads para varrer assinaturas em paralelo)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
+# Nome do arquivo de saída
+OUT_FILE = f"resources_all_subs_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+
+# ================== Auth ==================
+credential = DefaultAzureCredential()
+
+# ================== Helpers ==================
+def list_subscriptions() -> List[Dict[str, str]]:
+    sub_client = SubscriptionClient(credential)
+    subs = []
+    for s in sub_client.subscriptions.list():
+        if SUBSCRIPTION_ID_ALLOWLIST and s.subscription_id not in SUBSCRIPTION_ID_ALLOWLIST:
+            continue
+        subs.append({"id": s.subscription_id, "name": s.display_name})
+    return subs
+
+def safe_list_resources(sub_id: str) -> Iterable[Any]:
+    """
+    Lista recursos de uma assinatura com reintento simples para lidar com throttling/erros transitórios.
+    """
+    client = ResourceManagementClient(credential, sub_id)
+    backoffs = [0, 2, 5, 10]
+    last_err = None
+    for delay in backoffs:
+        try:
+            if delay:
+                time.sleep(delay)
+            # resources.list() pagina automaticamente
+            return client.resources.list(expand="createdTime,changedTime")
+        except Exception as e:  # HttpResponseError, ServiceRequestError etc.
+            last_err = e
+    # se falhar, propaga a última exceção
+    raise last_err
+
+def normalize_row(sub_id: str, sub_name: str, r: Any) -> Dict[str, Any]:
+    """
+    Constrói uma linha padronizada do recurso.
+    """
+    # Alguns SDKs não trazem resource_group direto, então extraímos do ID
+    try:
+        rg = getattr(r, "resource_group", None)
+        if not rg:
+            rg = parse_resource_id(r.id).get("resource_group")
+    except Exception:
+        rg = None
+
+    # Campos comuns
+    row = {
+        "subscriptionId": sub_id,
+        "subscriptionName": sub_name,
+        "resourceId": getattr(r, "id", None),
+        "resourceGroup": rg,
+        "resourceType": getattr(r, "type", None),
+        "resourceName": getattr(r, "name", None),
+        "location": getattr(r, "location", None),
+        "kind": getattr(r, "kind", None),
+        "sku": getattr(getattr(r, "sku", None), "name", None) if getattr(r, "sku", None) else None,
+        "tags": None,
+        "createdTime": getattr(r, "created_time", None),
+        "changedTime": getattr(r, "changed_time", None),
+    }
+
+    # Tags (dicionário) -> string chave=valor;chave2=valor2
+    tags = getattr(r, "tags", None)
+    if isinstance(tags, dict):
+        row["tags"] = ";".join(f"{k}={v}" for k, v in tags.items())
+
+    return row
+
+def process_subscription(sub: Dict[str, str]) -> List[Dict[str, Any]]:
+    sub_id, sub_name = sub["id"], sub["name"]
+    results: List[Dict[str, Any]] = []
+    for r in safe_list_resources(sub_id):
+        if RESOURCE_TYPE_FILTER and getattr(r, "type", None) != RESOURCE_TYPE_FILTER:
+            continue
+        results.append(normalize_row(sub_id, sub_name, r))
+    return results
+
+# ================== Run ==================
+def main():
+    subs = list_subscriptions()
+    if not subs:
+        print("Nenhuma assinatura encontrada para o contexto atual.")
+        return
+
+    all_rows: List[Dict[str, Any]] = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {executor.submit(process_subscription, sub): sub for sub in subs}
+        for fut in as_completed(future_map):
+            sub = future_map[fut]
+            try:
+                rows = fut.result()
+                all_rows.extend(rows)
+                print(f"[OK] {sub['name']} ({sub['id']}): {len(rows)} recursos")
+            except Exception as e:
+                print(f"[ERRO] {sub['name']} ({sub['id']}): {e}")
+
+    # Ordena pelos campos de interesse: tipo, assinatura, nome do recurso
+    all_rows.sort(key=lambda x: (x.get("resourceType") or "", x.get("subscriptionName") or "", x.get("resourceName") or ""))
+
+    # Escreve CSV
+    fieldnames = [
+        "subscriptionId",
+        "subscriptionName",
+        "resourceId",
+        "resourceGroup",
+        "resourceType",
+        "resourceName",
+        "location",
+        "kind",
+        "sku",
+        "tags",
+        "createdTime",
+        "changedTime",
+    ]
+    with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"\nSalvo: {OUT_FILE}")
+    print(f"Total de recursos: {len(all_rows)}")
+
+if __name__ == "__main__":
+    main()
